@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="es">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b7f83">
+  <title>Portal médico | DRBOT</title>
+  <link rel="icon" type="image/png" href="/assets/images/drbot_logo_transparente.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">DRBOT <small>Portal médico</small></div>
+      <button id="logout" class="btn btn-secondary" hidden>Cerrar sesión</button>
+    </div>
+  </header>
+  <main>
+    <section id="login-panel" class="panel login">
+      <h1>Acceso para médicos</h1>
+      <p class="muted">Inicia sesión con las credenciales médicas asignadas.</p>
+      <form id="login-form">
+        <label class="field">Correo electrónico
+          <input id="email" type="email" autocomplete="username" required>
+        </label>
+        <label class="field">Contraseña
+          <input id="password" type="password" autocomplete="current-password" required>
+        </label>
+        <button id="login-button" class="btn" style="width:100%;margin-top:20px">Iniciar sesión</button>
+      </form>
+      <div id="login-message" class="notice" role="status" hidden></div>
+    </section>
+
+    <section id="dashboard" hidden>
+      <div class="toolbar">
+        <div>
+          <h1 id="welcome">Citas asignadas</h1>
+          <p class="muted">Añade el diagnóstico y el informe para cerrar cada cita.</p>
+        </div>
+        <button id="refresh" class="btn btn-secondary">Actualizar</button>
+      </div>
+      <div id="page-message" class="notice" role="status" hidden></div>
+      <section class="filters panel" aria-label="Filtros de citas">
+        <label for="status-filter">Estado de la cita
+          <select id="status-filter">
+            <option value="all">Todos los estados</option>
+            <option value="pending">Pendientes de check-in</option>
+            <option value="checkedIn">En sala de espera</option>
+            <option value="completed">Completadas</option>
+          </select>
+        </label>
+        <label for="patient-filter">Código del paciente (UID)
+          <input id="patient-filter" type="search" placeholder="Buscar por UID del paciente" autocomplete="off">
+        </label>
+        <button id="clear-filters" class="btn btn-secondary" type="button">Limpiar filtros</button>
+        <span id="filter-count" class="filter-count muted" aria-live="polite"></span>
+      </section>
+      <div id="appointments" class="grid"></div>
+    </section>
+  </main>
+  <script type="module" src="script.js"></script>
+</body>
+</html>

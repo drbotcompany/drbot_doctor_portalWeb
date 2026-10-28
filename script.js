@@ -1,0 +1,888 @@
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
+    import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
+    import { getFirestore, collection, collectionGroup, doc, getDocs, query, where, limit, serverTimestamp, runTransaction, addDoc, updateDoc, setDoc, writeBatch } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyDgk-bPW7VKpYB_iQCZve64r9q6xmI6W34",
+      authDomain: "drbot-app.firebaseapp.com",
+      projectId: "drbot-app",
+      messagingSenderId: "668754273407",
+      appId: "1:668754273407:web:e5d504abcbc2d58794cb4a"
+    };
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+    const loginPanel = document.getElementById("login-panel");
+    const dashboard = document.getElementById("dashboard");
+    const loginMessage = document.getElementById("login-message");
+    const pageMessage = document.getElementById("page-message");
+    const appointmentList = document.getElementById("appointments");
+    const loginButton = document.getElementById("login-button");
+    const logoutButton = document.getElementById("logout");
+    let doctor = null;
+    let currentRecords = [];
+
+    function message(element, text, isError) {
+      element.textContent = text;
+      element.classList.toggle("error", Boolean(isError));
+      element.hidden = !text;
+    }
+    function friendlyError(error) {
+      if (error.code === "auth/invalid-credential" || error.code === "functions/unauthenticated") return "Código de médico o contraseña incorrectos.";
+      if (error.code === "auth/too-many-requests") return "Demasiados intentos. Prueba más tarde.";
+      if (error.code === "permission-denied") return "No tienes permiso para realizar esta operación. Revisa las reglas de Firestore.";
+      return error.message || "Ha ocurrido un error. Inténtalo de nuevo.";
+    }
+    function dateLabel(value) {
+      let date = null;
+      if (value && typeof value.toDate === "function") date = value.toDate();
+      else if (typeof value === "string") date = new Date(value);
+      if (!date || Number.isNaN(date.getTime())) return "Fecha no disponible";
+      return new Intl.DateTimeFormat("es-ES", { dateStyle: "medium", timeStyle: "short" }).format(date);
+    }
+    function agendaDateLabel(value) {
+      const raw = String(value || "").trim();
+      let date = null;
+      if (/^\d{8}$/.test(raw)) {
+        date = new Date(Number(raw.slice(0, 4)), Number(raw.slice(4, 6)) - 1, Number(raw.slice(6, 8)));
+      } else if (value && typeof value.toDate === "function") {
+        date = value.toDate();
+      } else if (raw) {
+        date = new Date(raw);
+      }
+      if (!date || Number.isNaN(date.getTime())) return "Fecha no disponible";
+      return new Intl.DateTimeFormat("es-ES", { dateStyle: "medium" }).format(date);
+    }
+    function agendaTimeLabel(value) {
+      const raw = String(value ?? "").trim();
+      const match = raw.match(/^(\d{1,2}):?(\d{2})$/);
+      return match ? `${match[1].padStart(2, "0")}:${match[2]}` : (raw || "No indicado");
+    }
+    function detail(label, value) {
+      const box = document.createElement("div");
+      box.className = "detail";
+      const heading = document.createElement("b");
+      heading.textContent = label;
+      const text = document.createElement("span");
+      text.textContent = value || "No indicado";
+      box.append(heading, text);
+      return box;
+    }
+
+    async function resolveDoctor(user) {
+      const q = query(collection(db, "Doctors"), where("authUid", "==", user.uid), limit(1));
+      const result = await getDocs(q);
+      if (result.empty) throw new Error("La cuenta ha iniciado sesión, pero su UID no está vinculado a un médico en Doctors.authUid.");
+      const item = result.docs[0];
+      const doctorData = item.data();
+      const insurerData = doctorData.insurers && !Array.isArray(doctorData.insurers)
+        ? doctorData.insurers
+        : {};
+      doctor = {
+        id: item.id,
+        name: String(doctorData.name || insurerData.name || "Médico"),
+        specialty: String(doctorData.specialty || ""),
+        centerName: String(doctorData.centerName || "")
+      };
+      document.getElementById("welcome").textContent = "Citas de " + doctor.name;
+      await loadAppointments();
+    }
+
+    function millisOf(value) {
+      if (value && typeof value.toMillis === "function") return value.toMillis();
+      if (value && typeof value.toDate === "function") return value.toDate().getTime();
+      if (value instanceof Date) return value.getTime();
+      const parsed = new Date(value).getTime();
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    async function loadAppointments() {
+      appointmentList.replaceChildren();
+      message(pageMessage, "Cargando citas...", false);
+
+      const slotsQuery = query(
+        collection(db, "Slots"),
+        where("doctorId", "==", doctor.id)
+      );
+      const appointmentsQuery = query(
+        collectionGroup(db, "appointments"),
+        where("doctorId", "==", doctor.id)
+      );
+
+      const [slotsResult, appointmentsResult] = await Promise.all([
+        getDocs(slotsQuery),
+        getDocs(appointmentsQuery)
+      ]);
+
+      const appointmentBySlot = new Map();
+      for (const snapshot of appointmentsResult.docs) {
+        const data = snapshot.data();
+        const patientUid = snapshot.ref.parent.parent
+          ? snapshot.ref.parent.parent.id
+          : "";
+        const dateMillis = millisOf(data.date);
+        if (!patientUid || dateMillis === null) continue;
+        appointmentBySlot.set(patientUid + "|" + dateMillis, {
+          ref: snapshot.ref,
+          data
+        });
+      }
+
+      currentRecords = slotsResult.docs.map(snapshot => {
+        const slotData = snapshot.data();
+        const patientUid = String(slotData.uid || "");
+        const dateMillis = millisOf(slotData.date);
+        const appointment = dateMillis === null
+          ? null
+          : appointmentBySlot.get(patientUid + "|" + dateMillis);
+
+        return {
+          ref: snapshot.ref,
+          appointmentRef: appointment ? appointment.ref : null,
+          id: snapshot.id,
+          patientUid,
+          slotData,
+          appointmentData: appointment ? appointment.data : null,
+          data: { ...slotData, ...(appointment ? appointment.data : {}) }
+        };
+      });
+
+      currentRecords.sort((a, b) => (millisOf(a.data.date) || 0) - (millisOf(b.data.date) || 0));
+      message(pageMessage, "", false);
+      renderAppointmentList();
+    }
+
+    function renderAppointmentList() {
+      appointmentList.replaceChildren();
+      const selectedStatus = document.getElementById("status-filter").value;
+      const patientCode = document.getElementById("patient-filter").value.trim().toLocaleLowerCase("es");
+      const filteredRecords = currentRecords.filter(record => {
+        const status = record.data.status || "requested";
+        const matchesStatus = selectedStatus === "all"
+          || (selectedStatus === "checkedIn" && status === "checkedIn")
+          || (selectedStatus === "completed" && status === "completed")
+          || (selectedStatus === "pending" && status !== "checkedIn" && status !== "completed");
+        const matchesPatient = record.patientUid.toLocaleLowerCase("es").includes(patientCode);
+        return matchesStatus && matchesPatient;
+      });
+      document.getElementById("filter-count").textContent = filteredRecords.length + " de " + currentRecords.length + " citas";
+
+      if (!filteredRecords.length) {
+        const empty = document.createElement("div");
+        empty.className = "panel empty muted";
+        empty.textContent = currentRecords.length
+          ? "No hay citas que coincidan con esos filtros."
+          : "No hay citas asignadas a tu perfil.";
+        appointmentList.append(empty);
+        return;
+      }
+
+      filteredRecords.forEach(record => appointmentList.append(renderAppointment(record)));
+    }
+
+    function renderAppointment(record) {
+      const data = record.data;
+      const center = data.medicalCenter || {};
+      const card = document.createElement("details");
+      card.className = "panel appointment";
+      card.open = true;
+
+      const head = document.createElement("summary");
+      head.className = "appointment-head";
+      const title = document.createElement("h2");
+      title.className = "appointment-title";
+      title.textContent = (data.specialty || doctor.specialty || "Cita médica") + " - " + dateLabel(data.date);
+      const badge = document.createElement("span");
+      const statusLabels = {
+        requested: "Solicitada",
+        scheduled: "Pendiente de check-in",
+        checkedIn: "En sala de espera",
+        inConsultation: "En consulta",
+        completed: "Completada",
+        cancelled: "Cancelada",
+        noShow: "No presentado"
+      };
+      badge.className = "badge" + (data.status === "completed" ? " completed" : "") + (data.status === "checkedIn" ? " checked-in" : "");
+      badge.textContent = statusLabels[data.status] || data.status || "Solicitada";
+      const toggleIcon = document.createElement("span");
+      toggleIcon.className = "appointment-toggle";
+      toggleIcon.setAttribute("aria-hidden", "true");
+      toggleIcon.textContent = "v";
+      head.append(title, badge, toggleIcon);
+
+      const appointmentDetails = document.createElement("div");
+      appointmentDetails.className = "details";
+      const content = document.createElement("div");
+      content.className = "appointment-content";
+      const slot = record.slotData || {};
+      appointmentDetails.append(
+        detail("Paciente - UID", record.patientUid),
+        detail("Identificador de cita", record.appointmentRef?.id),
+        detail("Fecha y hora", dateLabel(data.date || slot.date)),
+        detail("Estado", statusLabels[data.status] || data.status),
+        detail("M\u00E9dico", data.doctorName || doctor.name),
+        detail("Especialidad", data.specialty || doctor.specialty),
+        detail("Centro", center.name || doctor.centerName),
+        detail("Municipio", [center.municipality, center.province].filter(Boolean).join(", ")),
+        detail("D\u00EDa de agenda", agendaDateLabel(data.dateKey || slot.dateKey)),
+        detail("Hora de agenda", agendaTimeLabel(data.time || slot.time)),
+        detail("Cita completada", dateLabel(data.completedAt || slot.completedAt)),
+        detail("Diagn\u00F3stico principal", data.principalDisease || "Pendiente de registrar")
+      );
+      card.append(head);
+      content.append(appointmentDetails);
+
+      if (data.status === "completed") {
+        const report = document.createElement("div");
+        report.className = "medical-report";
+        const reportTitle = document.createElement("b");
+        reportTitle.textContent = "Informe de atención";
+        const reportText = document.createElement("span");
+        reportText.textContent = data.medicalReport || "No hay informe de texto guardado para esta cita.";
+        report.append(reportTitle, reportText);
+        content.append(report);
+        content.append(createMedicationSection(record));
+        const done = document.createElement("span");
+        done.className = "badge completed";
+        done.textContent = "Cita cerrada";
+        content.append(done);
+      } else if (!record.appointmentRef) {
+        const missing = document.createElement("p");
+        missing.className = "doc-name";
+        missing.textContent = "No se encontró el detalle de esta cita en el perfil del paciente.";
+        content.append(missing);
+      } else if (data.status !== "checkedIn") {
+        const waitingForCheckIn = document.createElement("p");
+        waitingForCheckIn.className = "doc-name";
+        waitingForCheckIn.textContent = "El paciente debe hacer check-in antes de que puedas añadir el diagnóstico y el informe.";
+        content.append(waitingForCheckIn);
+      } else {
+        const form = document.createElement("div");
+        form.className = "upload-row";
+
+        const diseaseLabel = document.createElement("label");
+        diseaseLabel.textContent = "Diagnóstico principal";
+        const diseaseInput = document.createElement("input");
+        diseaseInput.className = "disease-input";
+        diseaseInput.type = "text";
+        diseaseInput.maxLength = 300;
+        diseaseInput.placeholder = "Escribe el diagnóstico principal";
+        diseaseInput.setAttribute("aria-label", "Diagnóstico principal");
+        diseaseLabel.append(diseaseInput);
+
+        const reportLabel = document.createElement("label");
+        reportLabel.textContent = "Informe de atención";
+        const reportInput = document.createElement("textarea");
+        reportInput.className = "report-input";
+        reportInput.maxLength = 20000;
+        reportInput.placeholder = "Escribe el resumen de la atención, indicaciones y seguimiento";
+        reportInput.setAttribute("aria-label", "Informe de atención");
+        reportLabel.append(reportInput);
+
+        const button = document.createElement("button");
+        button.className = "btn";
+        button.type = "button";
+        button.textContent = "Guardar informe y cerrar cita";
+        button.addEventListener("click", () =>
+          saveReport(record, diseaseInput, reportInput, button, badge, card)
+        );
+
+        const diagnosisSection = document.createElement("details");
+        diagnosisSection.className = "record-section";
+        diagnosisSection.open = true;
+        const diagnosisHeading = document.createElement("summary");
+        diagnosisHeading.textContent = "Diagnóstico principal";
+        const diagnosisContent = document.createElement("div");
+        diagnosisContent.className = "record-section-content";
+        diagnosisContent.append(diseaseLabel);
+        diagnosisSection.append(diagnosisHeading, diagnosisContent);
+
+        const reportSection = document.createElement("details");
+        reportSection.className = "record-section";
+        const reportHeading = document.createElement("summary");
+        reportHeading.textContent = "Informe de atención";
+        const reportContent = document.createElement("div");
+        reportContent.className = "record-section-content";
+        reportContent.append(reportLabel, button);
+        reportSection.append(reportHeading, reportContent);
+
+        form.append(diagnosisSection, reportSection, createMedicationSection(record));
+        content.append(form);
+      }
+      card.append(content);
+      return card;
+    }
+
+    function createMedicationSection(record) {
+      const isClosed = record.data.status === "completed";
+      const section = document.createElement("details");
+      section.className = "medication-panel";
+      section.open = isClosed;
+      const heading = document.createElement("summary");
+      heading.textContent = isClosed ? "Medicamentos de la cita" : "Prescribir medicación";
+      const content = document.createElement("div");
+      content.className = "medication-content";
+      const help = document.createElement("p");
+      help.className = "medication-message";
+      help.textContent = isClosed
+        ? "Cita cerrada. Las prescripciones se muestran en modo de solo lectura."
+        : "Busca el medicamento en CIMA y completa la pauta. Las prescripciones activas se muestran al paciente; al retirarlas se conserva su historial.";
+
+      const searchRow = document.createElement("div");
+      searchRow.className = "medication-search";
+      const searchInput = document.createElement("input");
+      searchInput.type = "search";
+      searchInput.placeholder = "Nombre o principio activo";
+      searchInput.setAttribute("aria-label", "Buscar medicamento en CIMA");
+      const searchButton = document.createElement("button");
+      searchButton.type = "button";
+      searchButton.className = "btn btn-secondary";
+      searchButton.textContent = "Buscar en CIMA";
+      searchInput.disabled = isClosed;
+      searchButton.disabled = isClosed;
+      searchRow.append(searchInput, searchButton);
+
+      const status = document.createElement("p");
+      status.className = "medication-message";
+      status.setAttribute("role", "status");
+      const results = document.createElement("select");
+      results.className = "medication-results";
+      results.size = 6;
+      results.setAttribute("aria-label", "Seleccionar medicamento de los resultados de CIMA");
+      results.hidden = true;
+      const resultPlaceholder = document.createElement("option");
+      resultPlaceholder.value = "";
+      resultPlaceholder.textContent = "Selecciona un medicamento encontrado";
+      results.append(resultPlaceholder);
+      results.disabled = isClosed;
+      const selected = document.createElement("div");
+      const fields = document.createElement("div");
+      fields.className = "prescription-fields";
+      const draftList = document.createElement("div");
+      draftList.className = isClosed ? "draft-list prescription-list" : "draft-list";
+      const drafts = [];
+      let searchResults = [];
+      let selectedMedicine = null;
+
+      function medicationIdOf(medicine) {
+        const registration = String(medicine.nregistro || "").trim();
+        const name = String(medicine.nombre || "medicamento")
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .toLowerCase()
+          .replace(/[^a-z0-9_-]+/g, "-")
+          .replace(/^-|-$/g, "");
+        return (registration || name || "medicamento").replaceAll("/", "-");
+      }
+
+      function medicationRef(medicationId) {
+        return doc(db, "Prescriptions", medicationId);
+      }
+
+      function patientPrescriptions(medicationId, patientUid) {
+        return collection(db, "Prescriptions", medicationId, "Users", patientUid, "PatientPrescriptions");
+      }
+
+      function patientMedicationRef(medicationId, patientUid) {
+        return doc(db, "Prescriptions", medicationId, "Users", patientUid);
+      }
+
+      function patientPrescriptionRef(prescription) {
+        return doc(
+          db,
+          "Prescriptions",
+          prescription.medicationId,
+          "Users",
+          prescription.patientUid,
+          "PatientPrescriptions",
+          prescription.id
+        );
+      }
+
+      async function saveMedicationCatalog(medicine, medicationId) {
+        await setDoc(medicationRef(medicationId), {
+          cimaNregistro: String(medicine.nregistro || ""),
+          medicationName: String(medicine.nombre || ""),
+          activeIngredients: String(medicine.pactivos || ""),
+          updatedByDoctorId: doctor.id,
+          updatedAt: serverTimestamp()
+        }, { merge: true });
+      }
+
+      async function savePatientMedicationLink(medicationId, patientUid) {
+        await setDoc(patientMedicationRef(medicationId, patientUid), {
+          patientUid,
+          patientCode: patientUid,
+          updatedByDoctorId: doctor.id,
+          updatedAt: serverTimestamp()
+        }, { merge: true });
+      }
+
+      function inputField(labelText, type, placeholder) {
+        const label = document.createElement("label");
+        label.append(document.createTextNode(labelText));
+        const input = document.createElement("input");
+        input.type = type;
+        input.placeholder = placeholder || "";
+        label.append(input);
+        return { label, input };
+      }
+      const dose = inputField("Dosis prescrita", "text", "Ej.: la pauta indicada al paciente");
+      const frequency = inputField("Frecuencia", "text", "Ej.: cada cuántas horas / veces al día");
+      const route = inputField("Vía de administración", "text", "Ej.: oral");
+      const startDate = inputField("Fecha de inicio", "date", "");
+      const endDate = inputField("Fecha de fin", "date", "");
+      const instructionsLabel = document.createElement("label");
+      instructionsLabel.className = "wide";
+      instructionsLabel.append(document.createTextNode("Instrucciones adicionales"));
+      const instructions = document.createElement("textarea");
+      instructions.placeholder = "Indicaciones del médico";
+      instructionsLabel.append(instructions);
+      fields.append(dose.label, frequency.label, route.label, startDate.label, endDate.label, instructionsLabel);
+      for (const input of [dose.input, frequency.input, route.input, startDate.input, endDate.input, instructions]) {
+        input.disabled = isClosed;
+      }
+
+      const addButton = document.createElement("button");
+      addButton.type = "button";
+      addButton.className = "btn";
+      addButton.textContent = "Guardar prescripción";
+      addButton.disabled = true;
+      addButton.hidden = isClosed;
+      let editingIndex = null;
+
+      function renderDrafts() {
+        draftList.replaceChildren();
+        drafts.forEach((prescription, index) => {
+          const item = document.createElement("div");
+          item.className = "draft-item";
+          const name = document.createElement("strong");
+          name.textContent = prescription.medicationName || "Medicamento sin nombre";
+          const details = document.createElement("div");
+          details.className = "prescription-details";
+          const addDetail = (label, value) => {
+            if (!value) return;
+            const line = document.createElement("span");
+            line.textContent = `${label}: ${value}`;
+            details.append(line);
+          };
+          addDetail("Principio activo", prescription.activeIngredients);
+          addDetail("Dosis", prescription.dose);
+          addDetail("Frecuencia", prescription.frequency);
+          addDetail("Vía", prescription.route);
+          addDetail("Fecha de inicio", prescription.startDate);
+          addDetail("Fecha de fin", prescription.endDate || (prescription.startDate ? "Tratamiento crónico" : ""));
+          addDetail("Instrucciones", prescription.instructions);
+          const prescriptionStatus = document.createElement("span");
+          prescriptionStatus.className = "prescription-status" + (prescription.status === "discontinued" ? " discontinued" : "");
+          prescriptionStatus.textContent = prescription.status === "discontinued" ? "Retirada" : "Activa";
+          const actions = document.createElement("div");
+          actions.style.cssText = "display:flex;gap:8px;margin-top:8px";
+          if (!isClosed) {
+            const editButton = document.createElement("button");
+            editButton.type = "button";
+            editButton.className = "btn btn-secondary";
+            editButton.textContent = "Editar prescripción";
+            editButton.addEventListener("click", () => {
+              editingIndex = index;
+              selectedMedicine = {
+                nregistro: prescription.cimaNregistro,
+                nombre: prescription.medicationName,
+                pactivos: prescription.activeIngredients
+              };
+              dose.input.value = prescription.dose;
+              frequency.input.value = prescription.frequency;
+              route.input.value = prescription.route;
+              startDate.input.value = prescription.startDate;
+              endDate.input.value = prescription.endDate;
+              instructions.value = prescription.instructions;
+              addButton.textContent = "Guardar cambios";
+              addButton.disabled = false;
+              status.textContent = "Edita la pauta o selecciona otro medicamento y guarda los cambios.";
+              section.open = true;
+              fields.scrollIntoView({ behavior: "smooth", block: "center" });
+            });
+            const removeButton = document.createElement("button");
+            removeButton.type = "button";
+            removeButton.className = "btn btn-secondary";
+            removeButton.textContent = prescription.status === "discontinued"
+              ? "Retirada (historial conservado)"
+              : "Retirar prescripción";
+            removeButton.disabled = prescription.status === "discontinued";
+            removeButton.addEventListener("click", async () => {
+              try {
+                await updateDoc(patientPrescriptionRef(prescription), {
+                  status: "discontinued",
+                  updatedAt: serverTimestamp()
+                });
+                drafts[index].status = "discontinued";
+                if (editingIndex === index) editingIndex = null;
+                renderDrafts();
+                status.textContent = "Prescripción retirada; se conserva en el historial.";
+              } catch (error) {
+                status.textContent = `No se pudo retirar la prescripción: ${error.message}`;
+              }
+            });
+            actions.append(editButton, removeButton);
+          }
+          item.append(name, details, prescriptionStatus, actions);
+          draftList.append(item);
+        });
+      }
+
+      addButton.addEventListener("click", async () => {
+        if (isClosed) return;
+        if (!selectedMedicine) return;
+        if (!dose.input.value.trim() || !frequency.input.value.trim()) {
+          status.textContent = "Completa al menos la dosis y la frecuencia.";
+          return;
+        }
+        const prescription = {
+          patientUid: record.patientUid,
+          appointmentId: record.appointmentRef.id,
+          doctorId: doctor.id,
+          medicationId: medicationIdOf(selectedMedicine),
+          cimaNregistro: String(selectedMedicine.nregistro || ""),
+          medicationName: String(selectedMedicine.nombre || ""),
+          activeIngredients: String(selectedMedicine.pactivos || ""),
+          dose: dose.input.value.trim(),
+          frequency: frequency.input.value.trim(),
+          route: route.input.value.trim(),
+          startDate: startDate.input.value,
+          endDate: endDate.input.value,
+          instructions: instructions.value.trim()
+        };
+        addButton.disabled = true;
+        let savingStep = "guardar el medicamento en el catálogo";
+        try {
+          if (editingIndex === null) {
+            await saveMedicationCatalog(selectedMedicine, prescription.medicationId);
+            savingStep = "vincular el medicamento al paciente";
+            await savePatientMedicationLink(prescription.medicationId, prescription.patientUid);
+            savingStep = "crear la prescripción";
+            const prescriptionRef = await addDoc(
+              patientPrescriptions(prescription.medicationId, prescription.patientUid),
+              { ...prescription, status: "active", createdAt: serverTimestamp(), updatedAt: serverTimestamp() }
+            );
+            drafts.push({ ...prescription, id: prescriptionRef.id, status: "active" });
+            status.textContent = "Prescripción guardada para el paciente.";
+          } else {
+            const current = drafts[editingIndex];
+            if (current.medicationId !== prescription.medicationId) {
+              savingStep = "guardar el medicamento en el catálogo";
+              await saveMedicationCatalog(selectedMedicine, prescription.medicationId);
+              savingStep = "vincular el medicamento al paciente";
+              await savePatientMedicationLink(prescription.medicationId, prescription.patientUid);
+              savingStep = "reemplazar la prescripción";
+              const replacementRef = doc(patientPrescriptions(prescription.medicationId, prescription.patientUid));
+              const batch = writeBatch(db);
+              batch.set(replacementRef, {
+                ...prescription,
+                status: "active",
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp()
+              });
+              batch.update(patientPrescriptionRef(current), {
+                status: "discontinued",
+                updatedAt: serverTimestamp()
+              });
+              await batch.commit();
+              drafts[editingIndex] = { ...prescription, id: replacementRef.id, status: "active" };
+            } else {
+              savingStep = "actualizar la prescripción";
+              await updateDoc(patientPrescriptionRef(current), {
+                cimaNregistro: prescription.cimaNregistro,
+                medicationName: prescription.medicationName,
+                activeIngredients: prescription.activeIngredients,
+                dose: prescription.dose,
+                frequency: prescription.frequency,
+                route: prescription.route,
+                startDate: prescription.startDate,
+                endDate: prescription.endDate,
+                instructions: prescription.instructions,
+                status: "active",
+                updatedAt: serverTimestamp()
+              });
+              drafts[editingIndex] = { ...prescription, id: current.id, status: "active" };
+            }
+            editingIndex = null;
+            addButton.textContent = "Guardar prescripción";
+            status.textContent = "Prescripción actualizada.";
+          }
+          renderDrafts();
+        } catch (error) {
+          console.error("Error al guardar la prescripción", savingStep, error);
+          status.textContent = `No se pudo ${savingStep} (${error.code || "error"}): ${error.message}`;
+        } finally {
+          addButton.disabled = isClosed || !selectedMedicine;
+        }
+        dose.input.value = "";
+        frequency.input.value = "";
+        route.input.value = "";
+        startDate.input.value = "";
+        endDate.input.value = "";
+        instructions.value = "";
+      });
+
+      async function searchMedicines() {
+        const term = searchInput.value.trim();
+        if (term.length < 2) {
+          status.textContent = "Escribe al menos dos caracteres para buscar.";
+          return;
+        }
+        searchButton.disabled = true;
+        searchResults = [];
+        results.replaceChildren(resultPlaceholder.cloneNode(true));
+        results.hidden = true;
+        selected.replaceChildren();
+        selectedMedicine = null;
+        addButton.disabled = true;
+        status.textContent = "Buscando en CIMA…";
+        try {
+          const params = new URLSearchParams({ nombre: term, autorizados: "1", pagina: "1" });
+          const response = await fetch(`https://cima.aemps.es/cima/rest/medicamentos?${params}`);
+          if (!response.ok) throw new Error(`CIMA respondió ${response.status}.`);
+          const payload = await response.json();
+          const medicines = Array.isArray(payload) ? payload : (payload.resultados || payload.medicamentos || []);
+          if (!medicines.length) {
+            status.textContent = "No se encontraron medicamentos autorizados con esa búsqueda.";
+            return;
+          }
+          searchResults = medicines;
+          status.textContent = `${medicines.length} resultados en esta página. Selecciona un medicamento de la lista.`;
+          medicines.forEach((medicine, index) => {
+            const option = document.createElement("option");
+            option.value = String(index);
+            option.textContent = `${medicine.nombre || "Medicamento sin nombre"} · ${medicine.pactivos || "Principio activo no indicado"} · Registro ${medicine.nregistro || "—"}`;
+            results.append(option);
+          });
+          results.hidden = false;
+        } catch (error) {
+          status.textContent = `No se pudo consultar CIMA desde el navegador (${error.message}). Comprueba la conexión o si el navegador bloquea la petición.`;
+        } finally {
+          searchButton.disabled = false;
+        }
+      }
+
+      async function selectMedicine(medicine) {
+        selectedMedicine = medicine;
+        let detail = medicine;
+        try {
+          if (medicine.nregistro) {
+            const params = new URLSearchParams({ nregistro: String(medicine.nregistro) });
+            const response = await fetch(`https://cima.aemps.es/cima/rest/medicamento?${params}`);
+            if (response.ok) detail = await response.json();
+          }
+        } catch (_) {
+          // Se muestran los datos de la búsqueda si no se puede cargar la ficha completa.
+        }
+        selectedMedicine = { ...medicine, ...detail };
+        const info = document.createElement("div");
+        info.className = "medication-info";
+        const infoLines = [
+          ["Medicamento", detail.nombre || medicine.nombre],
+          ["Principios activos", detail.pactivos || medicine.pactivos],
+          ["Laboratorio", detail.labtitular || medicine.labtitular],
+          ["Condiciones de prescripción", detail.cpresc || medicine.cpresc],
+          ["Autorizado/comercializado", detail.comerc === true ? "Comercializado" : (detail.comerc === false ? "No comercializado" : "Consultar ficha")],
+          ["Problema de suministro", detail.psum === true ? "Sí: revisar disponibilidad" : (detail.psum === false ? "No indicado" : "Consultar ficha")]
+        ];
+        for (const [label, value] of infoLines) {
+          if (!value) continue;
+          const line = document.createElement("p");
+          const strong = document.createElement("strong");
+          strong.textContent = `${label}: `;
+          line.append(strong, document.createTextNode(String(value)));
+          info.append(line);
+        }
+        selected.replaceChildren(info);
+        addButton.disabled = false;
+        status.textContent = "Medicamento seleccionado. Completa ahora la pauta individual.";
+      }
+
+      searchButton.addEventListener("click", searchMedicines);
+      results.addEventListener("change", () => {
+        const index = Number(results.value);
+        if (Number.isInteger(index) && searchResults[index]) {
+          selectMedicine(searchResults[index]);
+        }
+      });
+      searchInput.addEventListener("keydown", event => {
+        if (event.key === "Enter") { event.preventDefault(); searchMedicines(); }
+      });
+
+      async function loadPatientPrescriptions() {
+        status.textContent = "Cargando medicación de este paciente…";
+        try {
+          const prescriptionsQuery = query(
+            collectionGroup(db, "PatientPrescriptions"),
+            where("patientUid", "==", record.patientUid),
+            where("doctorId", "==", doctor.id)
+          );
+          const result = await getDocs(prescriptionsQuery);
+          const appointmentId = record.appointmentRef?.id || "";
+          for (const snapshot of result.docs) {
+            const prescription = snapshot.data();
+            if (prescription.appointmentId !== appointmentId) continue;
+            drafts.push({ ...prescription, id: snapshot.id });
+          }
+          renderDrafts();
+          if (drafts.length) {
+            status.textContent = isClosed
+              ? "Prescripciones de la cita cerrada. Solo lectura; no se pueden editar ni retirar."
+              : "Medicación prescrita a este paciente. Puedes editarla o retirarla conservando el historial.";
+          } else {
+            status.textContent = "Este paciente todavía no tiene prescripciones de este médico.";
+          }
+        } catch (error) {
+          status.textContent = `No se pudo cargar la medicación previa: ${error.message}`;
+        }
+      }
+      let prescriptionsLoaded = false;
+      section.addEventListener("toggle", () => {
+        if (section.open && !prescriptionsLoaded) {
+          prescriptionsLoaded = true;
+          loadPatientPrescriptions();
+        }
+      });
+
+      if (isClosed) {
+        content.append(help, status, draftList);
+      } else {
+        content.append(help, searchRow, status, results, selected, fields, addButton, draftList);
+      }
+      section.append(heading, content);
+      if (isClosed) {
+        prescriptionsLoaded = true;
+        loadPatientPrescriptions();
+      }
+      return section;
+    }
+
+    async function saveReport(record, diseaseInput, reportInput, button, badge, card) {
+      const principalDisease = diseaseInput.value.trim();
+      const medicalReport = reportInput.value.trim();
+      if (!principalDisease) {
+        message(pageMessage, "Escribe el diagnóstico principal.", true);
+        diseaseInput.focus();
+        return;
+      }
+      if (!medicalReport) {
+        message(pageMessage, "Escribe el informe de atención.", true);
+        reportInput.focus();
+        return;
+      }
+
+      button.disabled = true;
+      button.textContent = "Guardando informe…";
+      message(pageMessage, "", false);
+      try {
+        const completedData = {
+          principalDisease,
+          medicalReport,
+          status: "completed",
+          completedAt: serverTimestamp()
+        };
+
+        const doctorId = String(record.slotData.doctorId || "");
+        const centerCode = String(
+          record.appointmentData?.centerCode ||
+          record.appointmentData?.medicalCenter?.code ||
+          ""
+        );
+        const dateKey = String(record.slotData.dateKey || "");
+        if (!doctorId || !centerCode || !dateKey) {
+          throw new Error("No se pudo identificar la cola de esta cita.");
+        }
+
+        const queueRef = doc(db, "Queues", `${doctorId}_${centerCode}_${dateKey}`);
+        await runTransaction(db, async transaction => {
+          const appointmentSnapshot = await transaction.get(record.appointmentRef);
+          const slotSnapshot = await transaction.get(record.ref);
+          const queueSnapshot = await transaction.get(queueRef);
+
+          if (!appointmentSnapshot.exists() || !slotSnapshot.exists()) {
+            throw new Error("No se encontró la cita o su horario.");
+          }
+
+          if (
+            appointmentSnapshot.data().status === "completed" &&
+            slotSnapshot.data().status === "completed"
+          ) {
+            return;
+          }
+
+          if (
+            appointmentSnapshot.data().status !== "checkedIn" ||
+            slotSnapshot.data().status !== "checkedIn"
+          ) {
+            throw new Error("La cita ya no está en sala de espera.");
+          }
+
+          if (!queueSnapshot.exists()) {
+            throw new Error("No se encontró la cola de esta cita.");
+          }
+
+          const completedCount =
+            Number(queueSnapshot.data().completedCount || 0) + 1;
+
+          transaction.update(record.appointmentRef, completedData);
+          transaction.update(record.ref, completedData);
+          transaction.update(queueRef, { completedCount });
+        });
+
+        record.data.principalDisease = principalDisease;
+        record.data.medicalReport = medicalReport;
+        record.data.status = "completed";
+        record.data.completedAt = new Date();
+        renderAppointmentList();
+        message(pageMessage, "Informe guardado y cita cerrada.", false);
+      } catch (error) {
+        message(pageMessage, friendlyError(error), true);
+        button.disabled = false;
+        button.textContent = "Guardar informe y cerrar cita";
+      }
+    }
+
+    document.getElementById("login-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      loginButton.disabled = true;
+      loginButton.textContent = "Accediendo…";
+      message(loginMessage, "", false);
+      try {
+        await signInWithEmailAndPassword(auth, document.getElementById("email").value.trim(), document.getElementById("password").value);
+      } catch (error) {
+        message(loginMessage, friendlyError(error), true);
+      } finally {
+        loginButton.disabled = false;
+        loginButton.textContent = "Iniciar sesión";
+      }
+    });
+
+    logoutButton.addEventListener("click", () => signOut(auth));
+    document.getElementById("status-filter").addEventListener("change", renderAppointmentList);
+    document.getElementById("patient-filter").addEventListener("input", renderAppointmentList);
+    document.getElementById("clear-filters").addEventListener("click", () => {
+      document.getElementById("status-filter").value = "all";
+      document.getElementById("patient-filter").value = "";
+      renderAppointmentList();
+    });
+    document.getElementById("refresh").addEventListener("click", async () => {
+      try { await loadAppointments(); }
+      catch (error) { message(pageMessage, friendlyError(error), true); }
+    });
+
+    onAuthStateChanged(auth, async user => {
+      loginPanel.hidden = Boolean(user);
+      dashboard.hidden = !user;
+      logoutButton.hidden = !user;
+      doctor = null;
+      if (!user) return;
+      try {
+        await resolveDoctor(user);
+      } catch (error) {
+        message(pageMessage, friendlyError(error), true);
+        if (!doctor) await signOut(auth);
+      }
+    });
